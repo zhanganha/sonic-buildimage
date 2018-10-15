@@ -1,0 +1,133 @@
+diff --git a/libteam/ifinfo.c b/libteam/ifinfo.c
+index 72155ae..b281677 100644
+--- a/libteam/ifinfo.c
++++ b/libteam/ifinfo.c
+@@ -55,6 +55,7 @@ struct team_ifinfo {
+ 	size_t			hwaddr_len;
+ 	char			orig_hwaddr[MAX_ADDR_LEN];
+ 	size_t			orig_hwaddr_len;
++	bool                    is_orig_hwaddr_set;
+ 	char			ifname[IFNAMSIZ];
+ 	uint32_t		master_ifindex;
+ 	bool			admin_state;
+@@ -105,15 +106,17 @@ static void update_hwaddr(struct team_ifinfo *ifinfo, struct rtnl_link *link)
+ 	hwaddr_len = nl_addr_get_len(nl_addr);
+ 	if (ifinfo->hwaddr_len != hwaddr_len) {
+ 		ifinfo->hwaddr_len = hwaddr_len;
+-		if (!ifinfo->master_ifindex)
++		if (!ifinfo->is_orig_hwaddr_set)
+ 			ifinfo->orig_hwaddr_len = hwaddr_len;
+ 		set_changed(ifinfo, CHANGED_HWADDR_LEN);
+ 	}
+ 	hwaddr = nl_addr_get_binary_addr(nl_addr);
+ 	if (memcmp(ifinfo->hwaddr, hwaddr, hwaddr_len)) {
+ 		memcpy(ifinfo->hwaddr, hwaddr, hwaddr_len);
+-		if (!ifinfo->master_ifindex)
++		if (!ifinfo->is_orig_hwaddr_set) {
+ 			memcpy(ifinfo->orig_hwaddr, hwaddr, hwaddr_len);
++			ifinfo->is_orig_hwaddr_set = true;
++		}
+ 		set_changed(ifinfo, CHANGED_HWADDR);
+ 	}
+ }
+diff --git a/teamd/teamd.c b/teamd/teamd.c
+index c987333..10914b8 100644
+--- a/teamd/teamd.c
++++ b/teamd/teamd.c
+@@ -116,7 +116,8 @@ static void print_help(const struct teamd_context *ctx) {
+             "    -D --dbus-enable         Enable D-Bus interface\n"
+             "    -Z --zmq-enable=ADDRESS  Enable ZeroMQ interface\n"
+             "    -U --usock-enable        Enable UNIX domain socket interface\n"
+-            "    -u --usock-disable       Disable UNIX domain socket interface\n",
++            "    -u --usock-disable       Disable UNIX domain socket interface\n"
++            "    -w --warm-reboot         Warm-reboot startup mode\n",
+             ctx->argv0);
+ 	printf("Available runners: ");
+ 	for (i = 0; i < TEAMD_RUNNER_LIST_SIZE; i++) {
+@@ -149,10 +150,11 @@ static int parse_command_line(struct teamd_context *ctx,
+ 		{ "zmq-enable",		required_argument,	NULL, 'Z' },
+ 		{ "usock-enable",	no_argument,		NULL, 'U' },
+ 		{ "usock-disable",	no_argument,		NULL, 'u' },
++		{ "warm-reboot",        no_argument,		NULL, 'w' },
+ 		{ NULL, 0, NULL, 0 }
+ 	};
+ 
+-	while ((opt = getopt_long(argc, argv, "hdkevf:c:p:groNt:nDZ:Uu",
++	while ((opt = getopt_long(argc, argv, "hdkevf:c:p:groNt:nDZ:Uuw",
+ 				  long_options, NULL)) >= 0) {
+ 
+ 		switch(opt) {
+@@ -230,6 +232,9 @@ static int parse_command_line(struct teamd_context *ctx,
+ 		case 'u':
+ 			ctx->usock.enabled = false;
+ 			break;
++		case 'w':
++			ctx->warm_reboot = true;
++			break;
+ 		default:
+ 			return -1;
+ 		}
+diff --git a/teamd/teamd.h b/teamd/teamd.h
+index ef0fb1c..36b80de 100644
+--- a/teamd/teamd.h
++++ b/teamd/teamd.h
+@@ -125,6 +125,7 @@ struct teamd_context {
+ 	char *				hwaddr;
+ 	uint32_t			hwaddr_len;
+ 	bool				hwaddr_explicit;
++	bool                            warm_reboot;
+ 	struct {
+ 		struct list_item		callback_list;
+ 		int				ctrl_pipe_r;
+diff --git a/teamd/teamd_runner_lacp.c b/teamd/teamd_runner_lacp.c
+index 81324de..56b8740 100644
+--- a/teamd/teamd_runner_lacp.c
++++ b/teamd/teamd_runner_lacp.c
+@@ -174,6 +174,7 @@ struct lacp_port {
+ 	struct lacp_port *agg_lead; /* leading port of aggregator.
+ 				     * NULL in case this port is not selected */
+ 	enum lacp_port_state state;
++	bool lacpdu_received;
+ 	struct {
+ 		uint32_t speed;
+ 		uint8_t	duplex;
+@@ -1080,6 +1081,14 @@ static int lacpdu_send(struct lacp_port *lacp_port)
+ 	memcpy(lacpdu.hdr.ether_dhost, ll_slow.sll_addr, ll_slow.sll_halen);
+ 	lacpdu.hdr.ether_type = htons(ETH_P_SLOW);
+ 
++	if (lacp_port->ctx->warm_reboot && !lacp_port->lacpdu_received && !(lacp_port->actor.state & INFO_STATE_SYNCHRONIZATION)) {
++		/* don't send lacpdu update in warm-reboot mode unless we receive lacp pdu from the partner */
++		return 0;
++	} else {
++		/* we have syncronized with the partner. Now we can send lacp pdu any time */
++		lacp_port->lacpdu_received = true;
++	}
++
+ 	err = teamd_send(lacp_port->sock, &lacpdu, sizeof(lacpdu), 0);
+ 	return err;
+ }
+@@ -1144,7 +1153,10 @@ static int lacp_callback_timeout(struct teamd_context *ctx, int events,
+ 		err = lacp_port_set_state(lacp_port, PORT_STATE_EXPIRED);
+ 		break;
+ 	case PORT_STATE_EXPIRED:
+-		err = lacp_port_set_state(lacp_port, PORT_STATE_DEFAULTED);
++		if (!lacp_port->ctx->warm_reboot) {
++			/* Don't transition into DEFAULT state in warm_reboot mode, which prevents port syncing */
++			err = lacp_port_set_state(lacp_port, PORT_STATE_DEFAULTED);
++		}
+ 		break;
+ 	case PORT_STATE_DEFAULTED:
+ 	case PORT_STATE_DISABLED:
+@@ -1321,7 +1333,11 @@ static void lacp_port_removed(struct teamd_context *ctx,
+ {
+ 	struct lacp_port *lacp_port = priv;
+ 
+-	lacp_port_set_state(lacp_port, PORT_STATE_DISABLED);
++	if (!lacp_port->ctx->warm_reboot) {
++		/* Don't transition into DISABLED state in warm-reboot mode,
++		   teamd will sends EXPIRED LACP PDU update in DISABLED state */
++		lacp_port_set_state(lacp_port, PORT_STATE_DISABLED);
++	}
+ 	teamd_loop_callback_del(ctx, LACP_TIMEOUT_CB_NAME, lacp_port);
+ 	teamd_loop_callback_del(ctx, LACP_PERIODIC_CB_NAME, lacp_port);
+ 	teamd_loop_callback_del(ctx, LACP_SOCKET_CB_NAME, lacp_port);
