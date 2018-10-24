@@ -41,7 +41,7 @@ Please refer to [SONiC roadmap](https://github.com/Azure/SONiC/wiki/Sonic-Roadma
 ## Clone or fetch the code repository with all git submodules
 To clone the code repository recursively, assuming git version 1.9 or newer:
 
-    git clone https://github.com/Azure/sonic-buildimage.git
+    git clone https://github.com/zhanganha/sonic-buildimage.git
 
 ## Usage
 
