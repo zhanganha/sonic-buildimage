@@ -294,7 +294,7 @@ RUN mkdir /var/run/sshd
 EXPOSE 22
 
 # Install depot-tools (for git-retry)
-RUN git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git /usr/share/depot_tools
+RUN git clone https://github.com/zhanganha/depot_tools.git /usr/share/depot_tools
 ENV PATH /usr/share/depot_tools:$PATH
 
 # Install docker engine 17.03.2~ce-0 inside docker and enable experimental feature
